@@ -1,0 +1,6 @@
+streamlit
+groq
+pandas
+matplotlib
+sec-edgar-downloader
+python-dotenv  
