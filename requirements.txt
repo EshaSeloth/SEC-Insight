@@ -1,6 +1,8 @@
 streamlit
-groq
 pandas
 matplotlib
+python-dotenv
+groq
 sec-edgar-downloader
-python-dotenv  
+requests
+beautifulsoup4
