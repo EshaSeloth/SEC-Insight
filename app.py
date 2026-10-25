@@ -1,5 +1,6 @@
 
 import os
+import re
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -9,9 +10,14 @@ from groq import Groq, GroqError
 
 from extractor import download_filings
 
+
+st.set_page_config(
+    page_title="SECInsight",
+    layout="centered",
+)
+
 load_dotenv()
 
-# API key: Streamlit Cloud Secrets or local .env
 try:
     api_key = st.secrets.get("GROQ_API_KEY")
 except Exception:
@@ -20,129 +26,165 @@ except Exception:
 api_key = api_key or os.getenv("GROQ_API_KEY")
 client = Groq(api_key=api_key) if api_key else None
 
-# Groq model used by all three AI features
 MODEL_ID = "openai/gpt-oss-120b"
 
 
 def run_groq(prompt):
-    """Send a prompt to Groq and handle API errors."""
     if client is None:
-        st.error(
-            "Groq API key not found. Add GROQ_API_KEY "
-            "to Streamlit Cloud Secrets."
-        )
+        st.error("Missing GROQ_API_KEY. Add it to Streamlit Secrets.")
         return None
 
     try:
         response = client.chat.completions.create(
             model=MODEL_ID,
-            messages=[
-                {"role": "user", "content": prompt}
-            ],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
         )
         return response.choices[0].message.content
 
     except GroqError as exc:
-        status_code = getattr(exc, "status_code", None)
+        status = getattr(exc, "status_code", None)
 
-        if status_code == 401:
-            message = (
-                "Invalid Groq API key. Check GROQ_API_KEY "
-                "in Streamlit Secrets."
-            )
-        elif status_code == 404:
-            message = (
-                f"Groq could not find model '{MODEL_ID}'. "
-                "Check the current model IDs in "
-                "https://console.groq.com/docs/models"
-            )
-        elif status_code == 429:
-            message = (
-                "Groq rate or usage limit reached. "
-                "Check your Groq Console usage."
-            )
+        if status == 401:
+            message = "Invalid Groq API key."
+        elif status == 404:
+            message = f"Model '{MODEL_ID}' was not found."
+        elif status == 429:
+            message = "Groq usage or rate limit reached."
         else:
-            message = (
-                f"Groq API request failed (HTTP "
-                f"{status_code or 'unknown'}). "
-                "Check Streamlit Cloud Logs."
-            )
+            message = f"Groq request failed (HTTP {status or 'unknown'})."
 
         st.error(message)
         return None
 
-    except Exception:
-        st.error(
-            "An unexpected AI error occurred. "
-            "Check Streamlit Cloud Logs for details."
-        )
+    except Exception as exc:
+        st.error(f"Unexpected AI error: {exc}")
         return None
 
 
-def analyze_with_ai(content):
-    prompt = f"""You are a financial analyst. Analyze this SEC 10-K filing and provide:
+def analyze_with_ai(filing):
+    content = filing.get("analysis_content") or filing["content"]
 
-1. A two-sentence summary of company performance.
-2. The top 3 risks mentioned.
-3. Management tone: Optimistic, Neutral, or Cautious.
-4. Overall investment signal: Positive, Neutral, or Negative.
+    prompt = f"""
+You are a careful financial analyst reviewing a company's SEC 10-K.
 
-Base your analysis on the supplied filing excerpt.
-Do not invent facts or claim to have reviewed content
-that was not provided.
+Ticker: {filing.get('ticker', 'Unknown')}
+Fiscal year: {filing['year']}
 
-Filing content:
-{content[:3000]}
+Analyze the substantive filing text supplied below.
 
-Keep your response concise and professional."""
+Return exactly these sections:
+
+PERFORMANCE SUMMARY:
+Write two sentences grounded in the supplied evidence.
+
+TOP THREE RISKS:
+List up to three specific risks actually supported by the text.
+If the evidence is insufficient, say so.
+
+MANAGEMENT TONE:
+Choose exactly one: Optimistic, Neutral, Cautious, or Insufficient Data.
+Explain briefly using evidence from the text.
+
+INVESTMENT SIGNAL:
+Choose exactly one: Positive, Neutral, Negative, or Insufficient Data.
+This is a filing-based assessment, not personalized investment advice.
+Do not infer a positive signal merely because positive words appear.
+If substantive evidence is insufficient, choose Insufficient Data.
+
+EVIDENCE LIMITATIONS:
+Identify any missing sections or data that limit your assessment.
+
+Rules:
+- Never invent financial figures, risks, or management statements.
+- Filing metadata alone is not evidence of company performance.
+- Distinguish reported results from forward-looking statements.
+- A risk disclosure does not automatically mean performance is negative.
+- If the text does not contain meaningful substantive evidence,
+  explicitly state that the analysis is limited.
+- Do not claim to have read parts of the filing that are absent.
+
+Filing text:
+{content[:22000]}
+"""
 
     return run_groq(prompt)
 
 
+def extract_label(text, section, allowed):
+    """Read a label only from the corresponding AI output section."""
+    match = re.search(
+        rf"{re.escape(section)}\s*:\s*(.*?)(?=\n[A-Z][A-Z ]+:\s*|\Z)",
+        text,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    if not match:
+        return "Insufficient Data"
+
+    section_text = match.group(1).strip()
+
+    for label in allowed:
+        if re.search(
+            rf"\b{re.escape(label)}\b",
+            section_text,
+            re.IGNORECASE,
+        ):
+            return label
+
+    return "Insufficient Data"
+
+
 def compare_years(results):
-    prompt = f"""You are a financial analyst. Compare these yearly
-SEC filing analyses.
+    summaries = "\n\n".join(
+        f"Fiscal year: {item['year']}\n"
+        f"Investment signal: {item['sentiment']}\n"
+        f"Management tone: {item['management_tone']}\n"
+        f"Analysis:\n{item['ai_analysis']}"
+        for item in results
+    )
 
-Describe how the company changed over the years.
-Has management's tone improved or worsened?
-Are the identified risks increasing or decreasing?
+    prompt = f"""
+Compare the supplied SEC 10-K analyses chronologically.
 
-Use only the information supplied. Do not invent trends.
-Keep your answer to 3 sentences.
+Explain:
+1. Meaningful changes in reported company performance.
+2. Changes in disclosed risks, if the evidence supports them.
+3. Changes in management tone, if assessable.
 
-Yearly analyses:
-{results}"""
+Do not invent trends or treat missing data as evidence of stability.
+Explicitly mention limitations when years lack substantive information.
+Keep the response concise.
 
+Analyses:
+{summaries}
+"""
     return run_groq(prompt)
 
 
 def answer_question(question, all_content):
-    prompt = f"""You are a financial analyst. Answer the question
-using only the SEC 10-K filing content supplied below.
+    prompt = f"""
+Answer the question using only the supplied SEC filing excerpts.
 
-If the information is missing, say so.
-Do not invent facts. Be concise and specific.
+Question: {question}
 
-Question:
-{question}
+Rules:
+- Cite the fiscal year in your answer when possible.
+- Do not invent facts or figures.
+- If the supplied excerpts do not contain the answer, say so.
+- Distinguish facts from interpretation.
+- Keep the answer concise.
 
-Filing content:
-{all_content[:6000]}"""
-
+Filing excerpts:
+{all_content[:18000]}
+"""
     return run_groq(prompt)
-
-
-st.set_page_config(
-    page_title="SECInsight",
-    layout="centered",
-)
-
 st.markdown(
     """
     <style>
     .header {
         text-align: center;
-        padding: 2rem 0 1rem 0;
+        padding: 1.5rem 0 1rem 0;
     }
     .header h1 {
         font-size: 2.8rem;
@@ -156,14 +198,14 @@ st.markdown(
     .header p {
         font-size: 1rem;
         color: #4a5568;
-        margin: 0;
     }
     </style>
+
     <div class="header">
         <h1>SEC<span>Insight</span></h1>
         <p>
             AI-powered analysis of SEC 10-K filings,
-            sentiment, risks and year-over-year trends
+            risks and year-over-year trends
         </p>
     </div>
     """,
@@ -172,25 +214,29 @@ st.markdown(
 
 st.divider()
 
-# Initialize session state
-for key in [
-    "results",
-    "all_content",
-    "yearly_summaries",
-    "ticker_analyzed",
-    "comparison",
-    "answer",
-]:
+defaults = {
+    "results": None,
+    "all_content": None,
+    "ticker_analyzed": None,
+    "comparison": None,
+    "answer": None,
+}
+
+for key, default in defaults.items():
     if key not in st.session_state:
-        st.session_state[key] = None
-
-
+        st.session_state[key] = default
 ticker = st.text_input(
     "Stock Ticker",
     placeholder="Enter ticker e.g. AAPL, TSLA, MSFT",
 ).strip().upper()
 
-years = st.slider("Years to analyze", 1, 5, 3)
+years = st.slider(
+    "Years to analyze",
+    min_value=1,
+    max_value=5,
+    value=3,
+    key="years_to_analyze",
+)
 
 analyze_button = st.button(
     "Analyze",
@@ -198,13 +244,19 @@ analyze_button = st.button(
 )
 
 if analyze_button:
+    st.session_state.results = None
+    st.session_state.all_content = None
+    st.session_state.ticker_analyzed = None
+    st.session_state.comparison = None
+    st.session_state.answer = None
+
     if not ticker:
         st.error("Please enter a ticker symbol.")
 
     elif client is None:
         st.error(
             "Groq API key not found. Add GROQ_API_KEY "
-            "to Streamlit Cloud Secrets before analyzing."
+            "to Streamlit Cloud Secrets."
         )
 
     else:
@@ -212,105 +264,96 @@ if analyze_button:
             with st.spinner("Downloading SEC filings..."):
                 filings = download_filings(ticker, years)
 
-        except Exception:
-            st.error(
-                "Could not download SEC filings. "
-                "Check the ticker and application logs."
-            )
-            filings = None
-
-        if not filings:
-            st.error(
-                "No filings found, or the SEC filing download failed."
-            )
-
-        else:
-            positive = [
-                "increase", "increased", "growth", "grew",
-                "strong", "record", "higher", "improved",
-                "expansion", "gained", "profitable", "success",
-                "opportunity", "favorable", "up",
-            ]
-
-            negative = [
-                "risk", "loss", "decline", "decreased",
-                "uncertainty", "lawsuit", "adverse",
-                "unfavorable", "impairment", "down", "weak",
-                "difficult", "challenge", "volatile", "deficit",
-            ]
-
-            results = []
-            yearly_summaries = ""
-            all_content = ""
-            ai_failed = False
-
-            for filing in filings:
-                content = filing["content"]
-
-                with st.spinner(
-                    f"Analyzing {filing['year']}..."
-                ):
-                    ai_analysis = analyze_with_ai(content)
-
-                if ai_analysis is None:
-                    ai_failed = True
-                    break
-
-                # Simple keyword counts, not a validated
-                # financial sentiment model.
-                text_content = content.lower()
-
-                pos_score = sum(
-                    text_content.count(word)
-                    for word in positive
+            if not filings:
+                st.error(
+                    "No usable 10-K filings were found. "
+                    "Check the ticker, SEC access and application logs."
                 )
 
-                neg_score = sum(
-                    text_content.count(word)
-                    for word in negative
-                )
+            else:
+                filings = filings[-years:]
 
-                if pos_score > neg_score:
-                    sentiment = "Positive"
-                elif neg_score > pos_score:
-                    sentiment = "Negative"
-                else:
-                    sentiment = "Neutral"
-
-                results.append({
-                    "year": filing["year"],
-                    "positive_signals": pos_score,
-                    "negative_signals": neg_score,
-                    "sentiment": sentiment,
-                    "ai_analysis": ai_analysis,
-                })
-
-                yearly_summaries += (
-                    f"\n{filing['year']}: {ai_analysis}\n"
-                )
-
-                all_content += (
-                    f"\n\n--- {filing['year']} ---\n{content}"
-                )
-
-            if not ai_failed:
-                with st.spinner(
-                    "Generating year-over-year comparison..."
-                ):
-                    comparison = compare_years(yearly_summaries)
-
-                if comparison is not None:
-                    st.session_state.results = results
-                    st.session_state.all_content = all_content
-                    st.session_state.yearly_summaries = (
-                        yearly_summaries
+                if len(filings) < years:
+                    st.warning(
+                        f"Requested {years} years, but only "
+                        f"{len(filings)} distinct usable fiscal "
+                        "years were found."
                     )
-                    st.session_state.ticker_analyzed = ticker
-                    st.session_state.comparison = comparison
-                    st.session_state.answer = None
 
+                results = []
+                content_parts = []
+                failed = False
 
-# Display analysis results
+                for filing in filings:
+                    filing["ticker"] = ticker
+
+                    with st.spinner(
+                        f"Analyzing fiscal year {filing['year']}..."
+                    ):
+                        analysis = analyze_with_ai(filing)
+
+                    if not analysis:
+                        failed = True
+                        break
+
+                    sentiment = extract_label(
+                        analysis,
+                        "INVESTMENT SIGNAL",
+                        [
+                            "Positive",
+                            "Neutral",
+                            "Negative",
+                            "Insufficient Data",
+                        ],
+                    )
+
+                    management_tone = extract_label(
+                        analysis,
+                        "MANAGEMENT TONE",
+                        [
+                            "Optimistic",
+                            "Neutral",
+                            "Cautious",
+                            "Insufficient Data",
+                        ],
+                    )
+
+                    results.append({
+                        "year": filing["year"],
+                        "sentiment": sentiment,
+                        "management_tone": management_tone,
+                        "ai_analysis": analysis,
+                        "filed_date": filing["filed_date"],
+                    })
+
+                    content_parts.append(
+                        f"\n\n--- Fiscal year {filing['year']} ---\n"
+                        f"{filing.get('analysis_content', filing['content'])}"
+                    )
+
+                if not failed and results:
+                    with st.spinner("Comparing fiscal years..."):
+                        comparison = compare_years(results)
+
+                    if comparison:
+                        st.session_state.results = results
+                        st.session_state.all_content = "\n".join(
+                            content_parts
+                        )
+                        st.session_state.ticker_analyzed = ticker
+                        st.session_state.comparison = comparison
+                    else:
+                        st.error(
+                            "The yearly analysis completed, but the "
+                            "comparison failed. Please analyze again."
+                        )
+
+        except Exception as exc:
+            st.error(
+                f"Analysis failed: {exc}. "
+                "Check the Streamlit Cloud logs for details."
+            )
+
 if st.session_state.results:
     results = st.session_state.results
     all_content = st.session_state.all_content
@@ -335,23 +378,13 @@ if st.session_state.results:
             f"{result['year']} — {result['sentiment']}",
             expanded=True,
         ):
-            col1, col2 = st.columns(2)
-
-            col1.metric(
-                "Positive Signals",
-                result["positive_signals"],
+            st.caption(
+                f"Management tone: {result['management_tone']}"
             )
-
-            col2.metric(
-                "Negative Signals",
-                result["negative_signals"],
-            )
-
-            st.info(result["ai_analysis"])
-
+            st.markdown(result["ai_analysis"])
     st.divider()
     st.subheader("Year-over-Year Comparison")
-    st.success(comparison)
+    st.write(comparison)
 
     st.divider()
     st.subheader("Ask a Question About These Filings")
@@ -359,83 +392,80 @@ if st.session_state.results:
     st.caption(
         f"Ask questions about {ticker_analyzed}'s SEC filings."
     )
-
-    question = st.text_input(
-        "Your question",
-        placeholder="e.g. What are the main revenue streams?",
-    )
-
-    if st.button("Ask", use_container_width=True):
+    with st.form("question_form"):
+        question = st.text_input(
+            "Your question",
+            placeholder="e.g. What are the main revenue streams?",
+        )
+        ask_button = st.form_submit_button("Ask")
+    if ask_button:
         if not question.strip():
             st.error("Please enter a question.")
         else:
-            with st.spinner("Finding answers from filings..."):
+            with st.spinner("Analyzing the supplied filing excerpts..."):
                 answer = answer_question(
                     question.strip(),
                     all_content,
                 )
-
-            if answer is not None:
+            if answer:
                 st.session_state.answer = answer
-
     if st.session_state.answer:
         st.info(st.session_state.answer)
-
     st.divider()
     st.subheader("Results Table")
-
-    df = pd.DataFrame(results)[
-        [
-            "year",
-            "positive_signals",
-            "negative_signals",
-            "sentiment",
-        ]
-    ]
-
-    st.dataframe(df, use_container_width=True)
-
-    csv = df.to_csv(index=False)
-
+    df = pd.DataFrame([
+        {
+            "Fiscal Year": item["year"],
+            "Management Tone": item["management_tone"],
+            "Investment Signal": item["sentiment"],
+            "Filing Date": item["filed_date"],
+        }
+        for item in results
+    ])
+    st.dataframe(df, use_container_width=True, hide_index=True)
     st.download_button(
         label="Download Results as CSV",
-        data=csv,
+        data=df.to_csv(index=False),
         file_name=f"{ticker_analyzed}_analysis.csv",
         mime="text/csv",
     )
-
     st.divider()
     st.subheader("Sentiment Trend")
-
+    sentiment_scores = {
+        "Negative": -1,
+        "Neutral": 0,
+        "Positive": 1,
+        "Insufficient Data": float("nan"),
+    }
+    plot_df = pd.DataFrame([
+        {
+            "year": item["year"],
+            "score": sentiment_scores[item["sentiment"]],
+        }
+        for item in results
+    ])
     fig, ax = plt.subplots(figsize=(9, 4))
 
     ax.plot(
-        df["year"],
-        df["positive_signals"],
-        label="Positive",
-        color="#1a3f6f",
+        plot_df["year"],
+        plot_df["score"],
         marker="o",
         linewidth=2,
     )
-
-    ax.plot(
-        df["year"],
-        df["negative_signals"],
-        label="Negative",
-        color="#c0392b",
-        marker="o",
-        linewidth=2,
+    ax.set_yticks(
+        [-1, 0, 1],
+        ["Negative", "Neutral", "Positive"],
     )
-
-    ax.set_xlabel("Year")
-    ax.set_ylabel("Signal Count")
-    ax.set_title(
-        f"{ticker_analyzed} - Sentiment Over Time",
-        fontweight="bold",
-    )
-    ax.legend()
+    ax.set_ylim(-1.3, 1.3)
+    ax.set_xlabel("Fiscal Year")
+    ax.set_title(f"{ticker_analyzed} — Filing Sentiment")
     ax.grid(True, alpha=0.3)
 
     st.pyplot(fig)
     plt.close(fig)
+
+    st.caption(
+        "Sentiment is an AI-generated interpretation of the supplied "
+        "filing text, not a validated prediction of stock returns."
+    )
 
