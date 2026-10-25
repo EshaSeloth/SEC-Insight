@@ -23,7 +23,7 @@ def download_filings(ticker, years):
 
     downloader = Downloader(
         "SECInsight",
-        "your-real-email@example.com",
+        "9f06eshaseloth@gmail.com",
     )
 
     downloader.get("10-K", ticker, limit=years)
