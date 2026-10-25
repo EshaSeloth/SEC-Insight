@@ -94,3 +94,4 @@ management_tone (Optimistic, Neutral, Cautious, or Insufficient Data),
 investment_signal (Positive, Neutral, Negative, or Insufficient Data),
 signal_evidence (string),
 evidence_limitations (string).
+
