@@ -36,6 +36,8 @@ def run_groq(prompt):
             message = "Invalid Groq API key."
         elif status == 404:
             message = f"Model '{MODEL_ID}' was not found."
+        elif status == 413:
+            message = "The request is too large. Reduce the filing text sent to Groq."
         elif status == 429:
             message = "Groq usage or rate limit reached."
         else:
@@ -48,41 +50,41 @@ def run_groq(prompt):
 
 def analyze_with_ai(filing):
     content = filing.get("analysis_content") or filing.get("content", "")
+    content = content[:4000]
     prompt = f"""
 You are a careful financial analyst reviewing a company's SEC 10-K.
 Ticker: {filing.get('ticker', 'Unknown')}
 Fiscal year: {filing['year']}
-Analyze the substantive filing text supplied below.
+
+Analyze only the supplied filing text. Be concise and do not invent facts.
 
 Return exactly these sections:
 
 PERFORMANCE SUMMARY:
-Write two sentences grounded in the supplied evidence.
+Write two evidence-based sentences.
 
 TOP THREE RISKS:
-List up to three specific risks supported by the text. If evidence is insufficient, say so.
+List up to three risks supported by the text. If evidence is insufficient, say so.
 
 MANAGEMENT TONE:
-Choose exactly one: Optimistic, Neutral, Cautious, or Insufficient Data. Explain briefly using evidence.
+Choose exactly one: Optimistic, Neutral, Cautious, or Insufficient Data. Explain briefly.
 
 INVESTMENT SIGNAL:
-Choose exactly one: Positive, Neutral, Negative, or Insufficient Data. This is a filing-based assessment, not personalized investment advice. Do not infer a positive signal merely because positive words appear. If substantive evidence is insufficient, choose Insufficient Data.
+Choose exactly one: Positive, Neutral, Negative, or Insufficient Data. This is a filing-based assessment, not personalized investment advice. Do not infer a positive signal from positive words alone.
 
 EVIDENCE LIMITATIONS:
-Identify missing sections or data that limit your assessment.
+State what missing information limits the analysis.
 
 Rules:
-- Never invent financial figures, risks, or management statements.
 - Filing metadata alone is not evidence of company performance.
+- Do not invent financial figures, risks, or management statements.
 - Distinguish reported results from forward-looking statements.
-- A risk disclosure does not automatically mean performance is negative.
-- If substantive evidence is insufficient, explicitly state that the analysis is limited.
-- Do not claim to have read parts of the filing that are absent.
+- If substantive evidence is insufficient, explicitly say so.
 - Begin each section with its exact heading.
 - Put the selected label immediately after MANAGEMENT TONE: and INVESTMENT SIGNAL:.
 
 Filing text:
-{content[:22000]}
+{content}
 """
     return run_groq(prompt)
 
@@ -103,12 +105,15 @@ def extract_label(text, section, allowed):
 
 def compare_years(results):
     summaries = "\n\n".join(
-        f"Fiscal year: {item['year']}\nInvestment signal: {item['sentiment']}\nManagement tone: {item['management_tone']}\nAnalysis:\n{item['ai_analysis']}"
+        f"Fiscal year: {item['year']}\n"
+        f"Investment signal: {item['sentiment']}\n"
+        f"Management tone: {item['management_tone']}\n"
+        f"Analysis:\n{item['ai_analysis'][:1000]}"
         for item in results
     )
     prompt = f"""
 Compare these SEC 10-K analyses chronologically.
-Explain meaningful changes in reported performance, disclosed risks, and management tone where evidence supports them. Do not invent trends or treat missing data as stability. Mention limitations when evidence is insufficient. Keep the response concise.
+Explain meaningful changes in reported performance, disclosed risks, and management tone only where evidence supports them. Do not invent trends or treat missing data as stability. Mention limitations when evidence is insufficient. Keep the response concise.
 
 Analyses:
 {summaries}
@@ -116,6 +121,7 @@ Analyses:
     return run_groq(prompt)
 
 def answer_question(question, all_content):
+    excerpts = all_content[:4000]
     prompt = f"""
 Answer the question using only the supplied SEC filing excerpts.
 
@@ -129,7 +135,7 @@ Rules:
 - Keep the answer concise.
 
 Filing excerpts:
-{all_content[:18000]}
+{excerpts}
 """
     return run_groq(prompt)
 
@@ -218,7 +224,7 @@ if analyze_button:
                     })
                     content_parts.append(
                         f"\n\n--- Fiscal year {filing['year']} ---\n"
-                        f"{filing.get('analysis_content') or filing.get('content', '')}"
+                        f"{(filing.get('analysis_content') or filing.get('content', ''))[:4000]}"
                     )
 
                 if failed:
